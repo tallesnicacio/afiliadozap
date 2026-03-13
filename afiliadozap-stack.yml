@@ -1,0 +1,44 @@
+version: "3.7"
+
+services:
+  app:
+    image: registry.meusocio.online/afiliadozap:latest
+    environment:
+      - NODE_ENV=production
+      - PORT=3500
+      - GOOGLE_SHEETS_ID=${GOOGLE_SHEETS_ID}
+      - GOOGLE_SERVICE_ACCOUNT_KEY=/app/credentials.json
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      - EVOLUTION_URL=${EVOLUTION_URL}
+      - EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
+      - EVOLUTION_INSTANCE=${EVOLUTION_INSTANCE}
+      - MIN_DELAY_MS=${MIN_DELAY_MS:-30000}
+      - MAX_DELAY_MS=${MAX_DELAY_MS:-60000}
+      - MAX_MSGS_PER_HOUR=${MAX_MSGS_PER_HOUR:-20}
+    volumes:
+      - vol_afiliadozap_data:/app/data
+      - vol_afiliadozap_logs:/app/logs
+      - /root/afiliadozap/credentials.json:/app/credentials.json:ro
+    networks:
+      - network_public
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.afiliadozap.rule=Host(`afiliadozap.meusocio.online`)"
+        - "traefik.http.routers.afiliadozap.entrypoints=websecure"
+        - "traefik.http.routers.afiliadozap.tls.certresolver=letsencryptresolver"
+        - "traefik.http.services.afiliadozap.loadbalancer.server.port=3500"
+
+volumes:
+  vol_afiliadozap_data:
+    name: volume_afiliadozap_data
+  vol_afiliadozap_logs:
+    name: volume_afiliadozap_logs
+
+networks:
+  network_public:
+    external: true
