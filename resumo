@@ -1,0 +1,368 @@
+# MVP — Sistema de Afiliados para Grupos de WhatsApp
+
+## Visão Geral
+
+Sistema para automatizar o envio de ofertas de afiliados (Shopee, Amazon, Mercado Livre, Magalu e outros) em grupos de WhatsApp de achados, com geração automática de copy via OpenAI GPT e agendamento de disparos via Evolution API.
+
+-----
+
+## Escopo do MVP
+
+|Incluso no MVP                      |Fora do MVP (futuro)          |
+|------------------------------------|------------------------------|
+|Cadastro manual de links de afiliado|Scraping automático de ofertas|
+|Geração de copy com GPT             |Painel web visual (React)     |
+|Agendamento de horários de envio    |Métricas de cliques/conversão |
+|Disparo via Evolution API           |Rotação automática de links   |
+|Cadastro de grupos de WhatsApp      |Multi-instância WhatsApp      |
+
+-----
+
+## Arquitetura
+
+```
+┌─────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│  Google Sheets   │────▶│   Node.js API    │────▶│  Evolution API   │
+│  (links/ofertas) │     │   (orquestrador) │     │   (WhatsApp)     │
+└─────────────────┘     └────────┬─────────┘     └──────────────────┘
+                                 │
+                        ┌────────▼─────────┐
+                        │   OpenAI GPT     │
+                        │ (geração de copy)│
+                        └──────────────────┘
+                                 │
+                        ┌────────▼─────────┐
+                        │   SQLite / JSON  │
+                        │  (agendamentos,  │
+                        │   grupos, logs)  │
+                        └──────────────────┘
+```
+
+**Stack técnica:**
+
+- **Runtime:** Node.js 18+
+- **Banco de dados:** SQLite (leve, sem infra extra — já roda no mesmo servidor)
+- **Planilha:** Google Sheets API v4 (pra cadastro de links/ofertas)
+- **IA:** OpenAI API (GPT-4o-mini — bom custo/benefício pra copy curta)
+- **WhatsApp:** Evolution API (instância já existente)
+- **Scheduler:** node-cron (agendamento local)
+- **HTTP:** Express.js (endpoints de controle)
+
+-----
+
+## Modelo de Dados
+
+### Tabela: `ofertas` (Google Sheets)
+
+|Coluna        |Tipo    |Exemplo                   |
+|--------------|--------|--------------------------|
+|id            |auto    |1                         |
+|plataforma    |texto   |Shopee                    |
+|nome_produto  |texto   |Fone Bluetooth TWS        |
+|link_afiliado |url     |https://s.shopee.com.br/… |
+|preco_original|número  |89.90                     |
+|preco_oferta  |número  |39.90                     |
+|desconto_pct  |número  |56                        |
+|categoria     |texto   |Eletrônicos               |
+|imagem_url    |url     |https://…                 |
+|cupom         |texto   |SHOPEE10                  |
+|validade      |data    |2026-03-20                |
+|status        |texto   |ativo / enviado / expirado|
+|criado_em     |datetime|2026-03-13 10:00          |
+
+### Tabela: `grupos` (SQLite)
+
+|Coluna   |Tipo      |Exemplo                      |
+|---------|----------|-----------------------------|
+|id       |INTEGER PK|1                            |
+|nome     |TEXT      |Achados do Dia               |
+|jid      |TEXT      |5511999999999-1234567890@g.us|
+|ativo    |BOOLEAN   |true                         |
+|criado_em|DATETIME  |2026-03-13                   |
+
+### Tabela: `agendamentos` (SQLite)
+
+|Coluna     |Tipo      |Exemplo                  |
+|-----------|----------|-------------------------|
+|id         |INTEGER PK|1                        |
+|oferta_id  |INTEGER FK|12                       |
+|grupo_id   |INTEGER FK|1                        |
+|horario    |TEXT      |09:00                    |
+|dias_semana|TEXT      |seg,ter,qua,qui,sex      |
+|status     |TEXT      |pendente / enviado / erro|
+|enviado_em |DATETIME  |null                     |
+
+### Tabela: `config_horarios` (SQLite)
+
+|Coluna       |Tipo      |Exemplo|
+|-------------|----------|-------|
+|id           |INTEGER PK|1      |
+|nome_faixa   |TEXT      |Manhã  |
+|hora_inicio  |TEXT      |08:00  |
+|hora_fim     |TEXT      |12:00  |
+|intervalo_min|INTEGER   |30     |
+|max_por_faixa|INTEGER   |5      |
+
+-----
+
+## Fluxo Principal
+
+### 1. Cadastro de Ofertas (manual)
+
+```
+Você preenche a planilha no Google Sheets
+  → Campos: nome, link, preço, desconto, cupom, imagem, plataforma
+  → Status inicial: "ativo"
+```
+
+### 2. Geração de Copy (automática)
+
+O sistema lê as ofertas ativas e gera a copy com GPT:
+
+**Prompt base:**
+
+```
+Você é um copywriter especialista em grupos de achados e ofertas no WhatsApp.
+Gere uma mensagem curta e persuasiva para o seguinte produto:
+
+Produto: {nome_produto}
+Plataforma: {plataforma}
+Preço original: R$ {preco_original}
+Preço oferta: R$ {preco_oferta}
+Desconto: {desconto_pct}%
+Cupom: {cupom}
+Link: {link_afiliado}
+
+Regras:
+- Use emojis moderadamente (3-5 por mensagem)
+- Comece com uma frase de impacto ou urgência
+- Destaque o desconto e o preço final
+- Inclua o cupom (se houver) de forma clara
+- Termine com o link
+- Máximo 500 caracteres
+- Tom: informal, empolgado mas não exagerado
+- NÃO use hashtags
+```
+
+**Exemplo de saída esperada:**
+
+```
+🔥 Achado do dia!
+
+Fone Bluetooth TWS por apenas R$ 39,90!
+Era R$ 89,90 — desconto de 56% 😱
+
+🎟️ Cupom: SHOPEE10
+
+Corre que acaba rápido 👇
+https://s.shopee.com.br/xxxx
+```
+
+### 3. Agendamento e Disparo
+
+```
+node-cron roda a cada minuto
+  → Verifica agendamentos pendentes para o horário atual
+  → Para cada agendamento:
+     1. Busca a oferta no Sheets
+     2. Gera (ou recupera cache) a copy via GPT
+     3. Envia via Evolution API (sendText ou sendMedia)
+     4. Atualiza status para "enviado"
+     5. Registra log
+  → Intervalo mínimo entre mensagens: 30s-60s (anti-ban)
+```
+
+-----
+
+## API Endpoints (Express)
+
+|Método|Rota                 |Descrição                          |
+|------|---------------------|-----------------------------------|
+|GET   |/api/ofertas         |Lista ofertas da planilha          |
+|POST  |/api/ofertas/sync    |Sincroniza planilha → cache local  |
+|GET   |/api/grupos          |Lista grupos cadastrados           |
+|POST  |/api/grupos          |Cadastra novo grupo (JID)          |
+|POST  |/api/copy/gerar      |Gera copy para uma oferta          |
+|POST  |/api/copy/preview    |Preview da mensagem antes de enviar|
+|GET   |/api/agendamentos    |Lista agendamentos                 |
+|POST  |/api/agendamentos    |Cria agendamento                   |
+|DELETE|/api/agendamentos/:id|Remove agendamento                 |
+|POST  |/api/disparar        |Disparo manual imediato            |
+|GET   |/api/logs            |Histórico de envios                |
+
+-----
+
+## Integração Evolution API
+
+**Envio de texto simples:**
+
+```javascript
+await fetch(`${EVOLUTION_URL}/message/sendText/${INSTANCE}`, {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'apikey': EVOLUTION_API_KEY
+  },
+  body: JSON.stringify({
+    number: grupo.jid,
+    text: copyGerada
+  })
+});
+```
+
+**Envio com imagem (quando tiver URL da imagem):**
+
+```javascript
+await fetch(`${EVOLUTION_URL}/message/sendMedia/${INSTANCE}`, {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'apikey': EVOLUTION_API_KEY
+  },
+  body: JSON.stringify({
+    number: grupo.jid,
+    mediatype: 'image',
+    media: oferta.imagem_url,
+    caption: copyGerada
+  })
+});
+```
+
+-----
+
+## Proteção Anti-Ban
+
+Essencial para não ter o número bloqueado:
+
+|Regra                    |Valor sugerido                |
+|-------------------------|------------------------------|
+|Intervalo entre mensagens|30-60 segundos (randomizado)  |
+|Máximo de mensagens/hora |15-20 por grupo               |
+|Máximo de grupos/disparo |5-10 simultâneos              |
+|Delay entre grupos       |2-5 minutos                   |
+|Faixas de horário        |08h-12h / 14h-18h / 19h-22h   |
+|Variação de copy         |Gerar 2-3 variações por oferta|
+|Dias de descanso         |Reduzir 50% nos domingos      |
+
+**Implementação:**
+
+```javascript
+function randomDelay(minMs, maxMs) {
+  return new Promise(resolve =>
+    setTimeout(resolve, Math.floor(Math.random() * (maxMs - minMs)) + minMs)
+  );
+}
+
+// Entre cada envio:
+await randomDelay(30000, 60000); // 30s a 60s
+```
+
+-----
+
+## Estrutura de Pastas do Projeto
+
+```
+afiliados-whatsapp/
+├── src/
+│   ├── index.js              # Entry point + Express server
+│   ├── config.js             # Variáveis de ambiente
+│   ├── db/
+│   │   ├── database.js       # Conexão SQLite
+│   │   └── migrations.js     # Criação de tabelas
+│   ├── services/
+│   │   ├── sheets.js         # Google Sheets API
+│   │   ├── openai.js         # Geração de copy
+│   │   ├── evolution.js      # Envio WhatsApp
+│   │   └── scheduler.js      # node-cron + lógica de disparo
+│   ├── routes/
+│   │   ├── ofertas.js
+│   │   ├── grupos.js
+│   │   ├── agendamentos.js
+│   │   └── disparos.js
+│   └── utils/
+│       ├── delay.js          # Random delay anti-ban
+│       └── logger.js         # Winston logger
+├── data/
+│   └── afiliados.db          # SQLite database
+├── .env                      # Configurações sensíveis
+├── package.json
+└── README.md
+```
+
+-----
+
+## Variáveis de Ambiente (.env)
+
+```env
+# Servidor
+PORT=3500
+NODE_ENV=production
+
+# Google Sheets
+GOOGLE_SHEETS_ID=sua_planilha_id
+GOOGLE_SERVICE_ACCOUNT_KEY=./credentials.json
+
+# OpenAI
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+
+# Evolution API
+EVOLUTION_URL=http://localhost:8080
+EVOLUTION_API_KEY=sua_api_key
+EVOLUTION_INSTANCE=sua_instancia
+
+# Anti-ban
+MIN_DELAY_MS=30000
+MAX_DELAY_MS=60000
+MAX_MSGS_PER_HOUR=20
+```
+
+-----
+
+## Custo Estimado Mensal
+
+|Item              |Estimativa                       |
+|------------------|---------------------------------|
+|OpenAI GPT-4o-mini|~R$ 15-30/mês (para ~1000 copys) |
+|Google Sheets API |Gratuito                         |
+|Evolution API     |Já rodando (custo zero adicional)|
+|Servidor          |Já rodando (mesmo VPS)           |
+|**Total**         |**~R$ 15-30/mês**                |
+
+-----
+
+## Cronograma de Desenvolvimento
+
+|Fase      |O que                                        |Tempo estimado|
+|----------|---------------------------------------------|--------------|
+|**Fase 1**|Setup do projeto + banco SQLite + config     |1 dia         |
+|**Fase 2**|Integração Google Sheets (leitura de ofertas)|1 dia         |
+|**Fase 3**|Serviço de geração de copy (OpenAI)          |1 dia         |
+|**Fase 4**|Integração Evolution API (envio)             |1 dia         |
+|**Fase 5**|Scheduler (node-cron + anti-ban)             |1-2 dias      |
+|**Fase 6**|API endpoints + testes                       |1 dia         |
+|**Fase 7**|Deploy + testes em produção                  |1 dia         |
+|**Total** |                                             |**~7-8 dias** |
+
+-----
+
+## Próximos Passos (pós-MVP)
+
+1. **Painel web React** — interface visual pra gerenciar tudo
+1. **Scraping automático** — buscar ofertas direto das plataformas
+1. **Métricas** — rastrear cliques nos links (encurtador com tracking)
+1. **Multi-instância** — rodar em vários números de WhatsApp
+1. **Rotação inteligente** — IA decide quais ofertas mandar baseado em engajamento
+1. **Templates de copy** — variações de estilo (urgência, comparação, storytelling)
+1. **Webhook de retorno** — receber notificação de vendas das plataformas
+
+-----
+
+## Decisão Pendente
+
+> **Google Sheets vs SQLite para as ofertas?**
+> 
+> - **Google Sheets**: mais fácil de editar no dia a dia, compartilhável, familiar
+> - **SQLite**: mais rápido, sem dependência externa, melhor pra automação pesada
+> 
+> **Recomendação:** Começar com Google Sheets (facilidade) e migrar pra SQLite se o volume crescer muito. O sistema lê da planilha e faz cache local de qualquer forma.
