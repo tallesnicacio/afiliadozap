@@ -22,6 +22,10 @@ module.exports = {
     instance: process.env.EVOLUTION_INSTANCE,
   },
 
+  dashboard: {
+    password: process.env.DASHBOARD_PASSWORD || 'afiliadozap123',
+  },
+
   antiban: {
     minDelayMs: parseInt(process.env.MIN_DELAY_MS) || 30000,
     maxDelayMs: parseInt(process.env.MAX_DELAY_MS) || 60000,

@@ -1,8 +1,10 @@
 require('dotenv').config();
+const path    = require('path');
 const express = require('express');
-const config = require('./config');
-const logger = require('./utils/logger');
+const config  = require('./config');
+const logger  = require('./utils/logger');
 const { runMigrations } = require('./db/migrations');
+const { authMiddleware } = require('./middleware/auth');
 
 const app = express();
 app.use(express.json());
@@ -14,21 +16,26 @@ runMigrations();
 const { iniciarScheduler } = require('./services/scheduler');
 iniciarScheduler();
 
-// Rotas
-app.use('/api/ofertas',       require('./routes/ofertas'));
-app.use('/api/grupos',        require('./routes/grupos'));
-app.use('/api/agendamentos',  require('./routes/agendamentos'));
-app.use('/api/copy',          require('./routes/copy'));
-app.use('/api',               require('./routes/disparos'));
+// Auth (público)
+app.use('/api/auth', require('./routes/auth'));
 
-// Health check
+// Health (público)
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', env: config.server.env, ts: new Date().toISOString() });
 });
 
-// 404
-app.use((req, res) => {
-  res.status(404).json({ error: `Rota não encontrada: ${req.method} ${req.path}` });
+// Rotas protegidas
+app.use('/api/ofertas',      authMiddleware, require('./routes/ofertas'));
+app.use('/api/grupos',       authMiddleware, require('./routes/grupos'));
+app.use('/api/agendamentos', authMiddleware, require('./routes/agendamentos'));
+app.use('/api/copy',         authMiddleware, require('./routes/copy'));
+app.use('/api',              authMiddleware, require('./routes/disparos'));
+
+// Frontend estático
+const publicDir = path.join(__dirname, 'public');
+app.use(express.static(publicDir));
+app.get('*', (req, res) => {
+  res.sendFile(path.join(publicDir, 'index.html'));
 });
 
 // Error handler
