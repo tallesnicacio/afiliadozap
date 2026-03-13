@@ -17,7 +17,7 @@ function runMigrations() {
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       plataforma      TEXT,
       nome_produto    TEXT NOT NULL,
-      link_afiliado   TEXT NOT NULL,
+      link_afiliado   TEXT NOT NULL UNIQUE,
       preco_original  REAL,
       preco_oferta    REAL,
       desconto_pct    INTEGER,
