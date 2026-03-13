@@ -15,7 +15,10 @@ async function sendText(jid, text) {
   const res = await fetch(url, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ number: jid, text }),
+    body: JSON.stringify({
+      number: jid,
+      textMessage: { text },        // formato Evolution API v1
+    }),
   });
 
   if (!res.ok) {
@@ -33,7 +36,14 @@ async function sendMedia(jid, mediaUrl, caption, mediatype = 'image') {
   const res = await fetch(url, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ number: jid, mediatype, media: mediaUrl, caption }),
+    body: JSON.stringify({
+      number: jid,
+      mediaMessage: {                // formato Evolution API v1
+        mediatype,
+        media: mediaUrl,
+        caption,
+      },
+    }),
   });
 
   if (!res.ok) {
