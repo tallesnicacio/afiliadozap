@@ -10,6 +10,40 @@ const headers = {
   'apikey': API_KEY,
 };
 
+async function checkConnection() {
+  try {
+    const res = await fetch(`${BASE_URL}/instance/fetchInstances`, { headers });
+    if (!res.ok) return false;
+    const data = await res.json();
+    const instance = data[0]?.instance || data[0];
+    const status = instance?.status || instance?.connectionStatus;
+    return status === 'open';
+  } catch {
+    return false;
+  }
+}
+
+async function reconnect() {
+  logger.warn('Evolution API desconectada — tentando reconectar...');
+  try {
+    const res = await fetch(`${BASE_URL}/instance/connect/${INSTANCE}`, { headers });
+    const data = await res.json();
+    if (data.base64) {
+      logger.warn('QR code gerado — escaneie em evoapi.meusocio.online/manager');
+    }
+    return data;
+  } catch (err) {
+    logger.error('Falha ao reconectar', { err: err.message });
+    throw err;
+  }
+}
+
+async function ensureConnected() {
+  const ok = await checkConnection();
+  if (!ok) await reconnect();
+  return ok;
+}
+
 async function sendText(jid, text) {
   const url = `${BASE_URL}/message/sendText/${INSTANCE}`;
   const res = await fetch(url, {
@@ -17,7 +51,7 @@ async function sendText(jid, text) {
     headers,
     body: JSON.stringify({
       number: jid,
-      textMessage: { text },        // formato Evolution API v1
+      textMessage: { text },
     }),
   });
 
@@ -38,11 +72,7 @@ async function sendMedia(jid, mediaUrl, caption, mediatype = 'image') {
     headers,
     body: JSON.stringify({
       number: jid,
-      mediaMessage: {                // formato Evolution API v1
-        mediatype,
-        media: mediaUrl,
-        caption,
-      },
+      mediaMessage: { mediatype, media: mediaUrl, caption },
     }),
   });
 
@@ -63,4 +93,4 @@ async function sendOferta(grupo, oferta, copy) {
   return sendText(grupo.jid, copy);
 }
 
-module.exports = { sendText, sendMedia, sendOferta };
+module.exports = { sendText, sendMedia, sendOferta, checkConnection, ensureConnected };

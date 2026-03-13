@@ -1,7 +1,7 @@
 const cron = require('node-cron');
 const { getDb } = require('../db/database');
 const { gerarCopy } = require('./openai');
-const { sendOferta } = require('./evolution');
+const { sendOferta, ensureConnected } = require('./evolution');
 const { randomDelay } = require('../utils/delay');
 const config = require('../config');
 const logger = require('../utils/logger');
@@ -10,35 +10,68 @@ const DIAS_MAP = { seg: 1, ter: 2, qua: 3, qui: 4, sex: 5, sab: 6, dom: 0 };
 
 let rodando = false;
 
-function getDiaAtual() {
-  return new Date().getDay(); // 0=dom, 1=seg...
-}
-
 function getHoraAtual() {
   const now = new Date();
   return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 }
 
+function getDiaAtual() {
+  return new Date().getDay();
+}
+
+function getDataHoje() {
+  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
 function dentroFaixaHorario(db) {
   const faixas = db.prepare('SELECT * FROM config_horarios WHERE ativo = 1').all();
-  const horaAtual = getHoraAtual();
-  return faixas.some(f => horaAtual >= f.hora_inicio && horaAtual <= f.hora_fim);
+  const hora = getHoraAtual();
+  return faixas.some(f => hora >= f.hora_inicio && hora <= f.hora_fim);
+}
+
+function foiEnviadoHoje(db, agendamento_id, grupo_id) {
+  const hoje = getDataHoje();
+  const result = db.prepare(`
+    SELECT COUNT(*) as total FROM logs_envio
+    WHERE grupo_id = ? AND status = 'enviado'
+    AND date(enviado_em) = ?
+    AND mensagem LIKE '%agendamento_id:' || ?
+  `).get(grupo_id, hoje, agendamento_id);
+
+  // Fallback simples: checa por oferta_id + grupo_id hoje
+  if (result.total === 0) {
+    const ag = db.prepare('SELECT * FROM agendamentos WHERE id = ?').get(agendamento_id);
+    const r2 = db.prepare(`
+      SELECT COUNT(*) as total FROM logs_envio
+      WHERE oferta_id = ? AND grupo_id = ? AND status = 'enviado'
+      AND date(enviado_em) = ?
+    `).get(ag?.oferta_id, grupo_id, hoje);
+    return r2.total > 0;
+  }
+  return result.total > 0;
 }
 
 function contarEnviosUltimaHora(db, grupo_id) {
-  const resultado = db.prepare(`
+  const { total } = db.prepare(`
     SELECT COUNT(*) as total FROM logs_envio
     WHERE grupo_id = ? AND status = 'enviado'
     AND enviado_em >= datetime('now', '-1 hour', 'localtime')
   `).get(grupo_id);
-  return resultado.total;
+  return total;
 }
 
-function registrarLog(db, { oferta_id, grupo_id, grupo_nome, status, mensagem, erro }) {
+function registrarLog(db, { agendamento_id, oferta_id, grupo_id, grupo_nome, status, mensagem, erro }) {
   db.prepare(`
     INSERT INTO logs_envio (oferta_id, grupo_id, grupo_nome, status, mensagem, erro)
     VALUES (?, ?, ?, ?, ?, ?)
-  `).run(oferta_id ?? null, grupo_id ?? null, grupo_nome ?? null, status, mensagem ?? null, erro ?? null);
+  `).run(
+    oferta_id ?? null,
+    grupo_id ?? null,
+    grupo_nome ?? null,
+    status,
+    mensagem ? `${mensagem}\nagendamento_id:${agendamento_id}` : null,
+    erro ?? null
+  );
 }
 
 async function processarAgendamento(db, agendamento) {
@@ -55,18 +88,14 @@ async function processarAgendamento(db, agendamento) {
     return;
   }
 
-  // Verifica limite de mensagens por hora
+  // Verifica limite msgs/hora
   const enviosUltimaHora = contarEnviosUltimaHora(db, grupo.id);
   if (enviosUltimaHora >= config.antiban.maxMsgsPerHour) {
-    logger.warn('Limite de mensagens/hora atingido', { grupo: grupo.nome, envios: enviosUltimaHora });
-    registrarLog(db, {
-      oferta_id: oferta.id, grupo_id: grupo.id, grupo_nome: grupo.nome,
-      status: 'pulado', mensagem: `Limite de ${config.antiban.maxMsgsPerHour} msgs/hora atingido`,
-    });
+    logger.warn('Limite msgs/hora atingido', { grupo: grupo.nome, envios: enviosUltimaHora });
     return;
   }
 
-  // Gera ou recupera copy do cache
+  // Gera ou usa copy em cache
   let copy = oferta.copy_gerada;
   if (!copy) {
     try {
@@ -76,74 +105,77 @@ async function processarAgendamento(db, agendamento) {
     } catch (err) {
       logger.error('Erro ao gerar copy', { produto: oferta.nome_produto, err: err.message });
       registrarLog(db, {
-        oferta_id: oferta.id, grupo_id: grupo.id, grupo_nome: grupo.nome,
+        agendamento_id: agendamento.id, oferta_id: oferta.id,
+        grupo_id: grupo.id, grupo_nome: grupo.nome,
         status: 'erro', erro: `Falha ao gerar copy: ${err.message}`,
       });
       return;
     }
   }
 
-  // Envia via Evolution API
+  // Envia
   try {
     logger.info('Enviando oferta', { produto: oferta.nome_produto, grupo: grupo.nome });
     await sendOferta(grupo, oferta, copy);
 
-    db.prepare(`UPDATE agendamentos SET status = 'enviado', enviado_em = datetime('now','localtime') WHERE id = ?`)
+    // Agendamentos recorrentes: mantém status 'pendente', controla por log
+    db.prepare(`UPDATE agendamentos SET enviado_em = datetime('now','localtime') WHERE id = ?`)
       .run(agendamento.id);
 
     registrarLog(db, {
-      oferta_id: oferta.id, grupo_id: grupo.id, grupo_nome: grupo.nome,
+      agendamento_id: agendamento.id, oferta_id: oferta.id,
+      grupo_id: grupo.id, grupo_nome: grupo.nome,
       status: 'enviado', mensagem: copy,
     });
 
     logger.info('Enviado com sucesso', { produto: oferta.nome_produto, grupo: grupo.nome });
   } catch (err) {
     logger.error('Erro ao enviar', { grupo: grupo.nome, err: err.message });
-    db.prepare(`UPDATE agendamentos SET status = 'erro' WHERE id = ?`).run(agendamento.id);
     registrarLog(db, {
-      oferta_id: oferta.id, grupo_id: grupo.id, grupo_nome: grupo.nome,
+      agendamento_id: agendamento.id, oferta_id: oferta.id,
+      grupo_id: grupo.id, grupo_nome: grupo.nome,
       status: 'erro', erro: err.message,
     });
   }
 }
 
 async function verificarAgendamentos() {
-  if (rodando) return; // evita sobreposição de execuções
+  if (rodando) return;
   rodando = true;
 
   const db = getDb();
-
   try {
     if (!dentroFaixaHorario(db)) return;
 
-    const horaAtual  = getHoraAtual();
-    const diaAtual   = getDiaAtual();
+    const horaAtual = getHoraAtual();
+    const diaAtual  = getDiaAtual();
 
-    // Busca agendamentos pendentes para o horário atual
     const agendamentos = db.prepare(`
-      SELECT * FROM agendamentos
-      WHERE status = 'pendente' AND horario = ?
+      SELECT * FROM agendamentos WHERE horario = ?
     `).all(horaAtual);
 
     if (agendamentos.length === 0) return;
 
-    // Filtra pelo dia da semana
-    const agendamentosDoDia = agendamentos.filter(a => {
+    // Filtra pelo dia da semana e se já foi enviado hoje
+    const pendentes = agendamentos.filter(a => {
       const dias = a.dias_semana.split(',').map(d => DIAS_MAP[d.trim()]);
-      return dias.includes(diaAtual);
+      if (!dias.includes(diaAtual)) return false;
+      if (foiEnviadoHoje(db, a.id, a.grupo_id)) return false;
+      return true;
     });
 
-    if (agendamentosDoDia.length === 0) return;
+    if (pendentes.length === 0) return;
 
-    logger.info(`Scheduler: ${agendamentosDoDia.length} agendamento(s) para ${horaAtual}`);
+    logger.info(`Scheduler: ${pendentes.length} agendamento(s) para ${horaAtual}`);
 
-    for (const agendamento of agendamentosDoDia) {
-      await processarAgendamento(db, agendamento);
+    // Verifica conexão antes de enviar
+    await ensureConnected();
 
-      // Anti-ban: delay entre cada envio
-      if (agendamentosDoDia.indexOf(agendamento) < agendamentosDoDia.length - 1) {
+    for (let i = 0; i < pendentes.length; i++) {
+      await processarAgendamento(db, pendentes[i]);
+      if (i < pendentes.length - 1) {
         const delay = Math.floor(Math.random() * (config.antiban.maxDelayMs - config.antiban.minDelayMs)) + config.antiban.minDelayMs;
-        logger.info(`Anti-ban: aguardando ${(delay / 1000).toFixed(0)}s antes do próximo envio`);
+        logger.info(`Anti-ban: aguardando ${(delay / 1000).toFixed(0)}s`);
         await randomDelay();
       }
     }
@@ -155,7 +187,6 @@ async function verificarAgendamentos() {
 }
 
 function iniciarScheduler() {
-  // Roda a cada minuto
   cron.schedule('* * * * *', verificarAgendamentos);
   logger.info('Scheduler iniciado (verifica a cada minuto)');
 }
