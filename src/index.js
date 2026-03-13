@@ -10,6 +10,10 @@ app.use(express.json());
 // Migrations
 runMigrations();
 
+// Scheduler
+const { iniciarScheduler } = require('./services/scheduler');
+iniciarScheduler();
+
 // Rotas
 app.use('/api/ofertas',       require('./routes/ofertas'));
 app.use('/api/grupos',        require('./routes/grupos'));
